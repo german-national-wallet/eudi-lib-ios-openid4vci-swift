@@ -103,7 +103,7 @@ public actor AuthorizationServerMetadataResolver: AuthorizationServerMetadataRes
       ) else {
         return nil
       }
-      
+      return nil
       return try? await fetcher.fetch(
         url: URL(string: "https://demo.pid-issuer.bundesdruckerei.de/pidp/.well-known/openid-credential-issuer")!
       ).get()
