@@ -14,85 +14,223 @@
  * limitations under the License.
  */
 import Foundation
-@preconcurrency import JOSESwift
+import os
 
-public enum CredentialIssuerSource: Sendable {
-  case credentialIssuer(CredentialIssuerId)
+// Result type for responses with headers
+public struct ResponseWithHeaders<Response> {
+  public let headers: [AnyHashable: Any]
+  public let body: Response
+  
+  public init(headers: [AnyHashable: Any], body: Response) {
+    self.headers = headers
+    self.body = body
+  }
 }
 
-public protocol CredentialIssuerMetadataType {
-  /// The input type for resolving a type.
-  associatedtype InputType: Sendable
-  
-  /// The output type for resolved type. Must be Codable and Equatable.
-  associatedtype OutputType: Decodable, Equatable, Sendable
-  
-  /// The error type for resolving type. Must conform to the Error protocol.
-  associatedtype ErrorType: Error
-  
-  /// Resolves type asynchronously.
-  ///
-  /// - Parameters:
-  ///   - source: The input source for resolving data.
-  /// - Returns: An asynchronous result containing the resolved data or an error.
-  func resolve(
-    source: InputType,
-    policy: IssuerMetadataPolicy
-  ) async throws -> Result<OutputType, ErrorType>
+public extension ResponseWithHeaders {
+  func headerValue(forKey key: AnyHashable) -> Any? {
+    return headers[key]
+  }
 }
 
-public actor CredentialIssuerMetadataResolver: CredentialIssuerMetadataType {
+public enum PostError: LocalizedError {
+  case invalidUrl
+  case networkError(Error)
+  case response(GenericErrorResponse)
+  case cannotParse(String)
+  case serverError
+  case useDpopNonce(Nonce)
   
-  private let fetcher: any MetadataFetching
+  /**
+   Provides a localized description of the post error.
+   
+   - Returns: A string describing the post error.
+   */
+  public var errorDescription: String? {
+    switch self {
+    case .invalidUrl:
+      return "Invalid URL"
+    case .networkError(let error):
+      return "Network Error: \(error.localizedDescription)"
+    case .response:
+      return "Generic error response"
+    case .cannotParse(let string):
+      return "Could not parse: \(string)"
+    case .serverError:
+      return "Server error"
+    case .useDpopNonce(let nonce):
+      return "Use dPopp Nonce error: \(nonce)"
+    }
+  }
+}
+
+public protocol PostingType {
   
+  var session: Networking { get set }
   
+  /**
+   Performs a POST request with the provided URLRequest.
+   
+   - Parameters:
+   - request: The URLRequest to be used for the POST request.
+   
+   - Returns: A Result type with the response data or an error.
+   */
+  func post<Response: Codable>(request: URLRequest) async -> Result<ResponseWithHeaders<Response>, PostError>
+  
+  /**
+   Performs a POST request with the provided URLRequest.
+   
+   - Parameters:
+   - request: The URLRequest to be used for the POST request.
+   
+   - Returns: A Result type with a success boolean (based on status code) or an error.
+   */
+  func check(request: URLRequest) async -> Result<Bool, PostError>
+}
+
+public struct Poster: PostingType {
+  
+  public var session: Networking
+  private let networkLogger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.myapp",
+                                   category: "Network")
+  
+  /**
+   Initializes a Poster instance.
+   */
   public init(
-    fetcher: MetadataFetching = MetadataFetcher()
+    session: Networking = URLSession.shared
   ) {
-    self.fetcher = fetcher
+    self.session = session
   }
   
-  /// Resolves client metadata asynchronously.
-  ///
-  /// - Parameters:
-  ///   - source: The input source for resolving metadata.
-  ///   - policy: The issuer metadata policy
-  /// - Returns: An asynchronous result containing the resolved metadata or an error of type ResolvingError.
-  public func resolve(
-    source: CredentialIssuerSource,
-    policy: IssuerMetadataPolicy
-  ) async throws -> Result<CredentialIssuerMetadata, CredentialIssuerMetadataError> {
-    switch source {
-    case .credentialIssuer(let issuerId):
-      let wellKnownURL = try buildWellKnownCredentialIssuerURL(from: issuerId.url)
+  /**
+   Performs a POST request with the provided URLRequest.
+   
+   - Parameters:
+   - request: The URLRequest to be used for the POST request.
+   
+   - Returns: A Result type with the response data or an error.
+   */
+  nonisolated public func log(request: URLRequest, responseData: Data? = nil, startTime: Date) {
+      let duration = Date().timeIntervalSince(startTime)
+    
+      networkLogger.info("0️⃣ ===================== Library Network Request Begin =====================")
+      networkLogger.info("1️⃣ URL: \(request.url?.absoluteString ?? "nil", privacy: .public)")
+      networkLogger.info("2️⃣ Method: \(request.httpMethod ?? "nil", privacy: .public)")
+    if let data = request.httpBody {
+      networkLogger.info("3️⃣ Body: \(String(data: data, encoding: .utf8) ?? "nil", privacy: .public))")
+    }
+     
+
+      if let headers = request.allHTTPHeaderFields, !headers.isEmpty {
+          networkLogger.info("4️⃣ Headers:")
+          headers.forEach { key, value in
+              networkLogger.info("   \(key): \(value, privacy: .public)")
+          }
+      } else {
+          networkLogger.info("4️⃣ Headers: none")
+      }
+
+      if let responseData {
+          networkLogger.info("✅ Response: \(responseData.prettyJson ?? "nil", privacy: .public)")
+      }
+      networkLogger.info("⏱ Duration: \(duration, format: .fixed(precision: 3)) seconds")
+      networkLogger.info("5️⃣ ===================== Network Request End =====================")
+  }
+  
+  public func post<Response: Codable>(request: URLRequest) async -> Result<ResponseWithHeaders<Response>, PostError> {
+    do {
+     let startTime = Date()
       
-      return await fetcher.fetchMetadata(
-        url: wellKnownURL,
-        policy: policy,
-        issuerId: issuerId
-      )
+      let (data, response) = try await self.session.data(for: request)
+      let httpResponse = (response as? HTTPURLResponse)
+      let statusCode = httpResponse?.statusCode ?? 0
+      let headers = httpResponse?.allHeaderFields ?? [:]
+      log(request: request, responseData: data, startTime: startTime)
+      
+      if statusCode >= HTTPStatusCode.badRequest && statusCode < HTTPStatusCode.internalServerError {
+        if let httpResponse,
+           httpResponse.containsDpopError(),
+           let dPopNonce = headers.value(forCaseInsensitiveKey: Constants.DPOP_NONCE_HEADER) as? String {
+          return .failure(
+            .useDpopNonce(
+              .init(
+                value: dPopNonce
+              )
+            )
+          )
+        } else {
+          let object = try JSONDecoder().decode(GenericErrorResponse.self, from: data)
+          if object.error == Constants.USE_DPOP_NONCE,
+             let dPopNonce = headers.value(forCaseInsensitiveKey: Constants.DPOP_NONCE_HEADER) as? String {
+            return .failure(
+              .useDpopNonce(
+                .init(
+                  value: dPopNonce
+                )
+              )
+            )
+          }
+          return .failure(.response(object))
+        }
+        
+      } else if statusCode >= HTTPStatusCode.internalServerError {
+        return .failure(.serverError)
+      }
+      
+      do {
+        let object = try JSONDecoder().decode(Response.self, from: data)
+        return .success(
+          .init(
+            headers: headers,
+            body: object
+          )
+        )
+      } catch {
+        if statusCode == HTTPStatusCode.ok, let string = String(data: data, encoding: .utf8) {
+          return .failure(.cannotParse(string))
+        } else {
+          return .failure(.networkError(error))
+        }
+      }
+      
+    } catch let error as NSError {
+      return .failure(.networkError(error))
+    } catch {
+      return .failure(.networkError(error))
+    }
+  }
+  
+  /**
+   Performs a POST request with the provided URLRequest.
+   
+   - Parameters:
+   - request: The URLRequest to be used for the POST request.
+   
+   - Returns: A Result type with a success boolean (based on status code) or an error.
+   */
+  public func check(request: URLRequest) async -> Result<Bool, PostError> {
+    do {
+      let (_, response) = try await self.session.data(for: request)
+      let httpResponse = (response as? HTTPURLResponse)
+      
+      return .success(httpResponse?.statusCode.isWithinRange(
+        HTTPStatusCode.ok...HTTPStatusCode.imUsed
+      ) ?? false)
+    } catch let error as NSError {
+      return .failure(.networkError(error))
+    } catch {
+      return .failure(.networkError(error))
     }
   }
 }
-      
-extension CredentialIssuerMetadataResolver {
-  func buildWellKnownCredentialIssuerURL(
-    from issuerURL: URL
-  ) throws -> URL {
-    
-    guard
-      var components = URLComponents(url: issuerURL, resolvingAgainstBaseURL: false)
-    else {
-      throw FetchError.invalidUrl
-    }
-    
-    let originalPath = components.percentEncodedPath
-    components.percentEncodedPath = "/.well-known/openid-credential-issuer" + originalPath
-    
-    guard let wellKnownURL = components.url else {
-      throw FetchError.invalidUrl
-    }
-    
-    return appendedUrl
+public extension Data {
+  var prettyJson: String? {
+    guard let object = try? JSONSerialization.jsonObject(with: self, options: []),
+          let data = try? JSONSerialization.data(withJSONObject: object, options: [.prettyPrinted, .sortedKeys]),
+          let prettyPrintedString = String(data: data, encoding: .utf8) else { return nil }
+
+    return prettyPrintedString
   }
 }
