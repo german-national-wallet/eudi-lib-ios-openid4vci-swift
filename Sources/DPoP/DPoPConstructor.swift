@@ -60,15 +60,18 @@ public final class DPoPConstructor: DPoPConstructorType {
   /// The private key used for signing the JWT.
   public let privateKey: SigningKeyProxy
 
+  public let keyAttestation: String?
+
   /// Initializes a new `DPoPConstructor`.
   /// - Parameters:
   ///   - algorithm: The signing algorithm to use.
   ///   - jwk: The JWK used in the JWT header.
   ///   - privateKey: The private key for signing the JWT.
-  public init(algorithm: JWSAlgorithm, jwk: JWK, privateKey: SigningKeyProxy) {
+  public init(algorithm: JWSAlgorithm, jwk: JWK, privateKey: SigningKeyProxy, keyAttestation: String? = nil) {
     self.algorithm = algorithm
     self.jwk = jwk
     self.privateKey = privateKey
+    self.keyAttestation = keyAttestation
   }
 
   /// Generates a DPoP JWT for the given endpoint.
@@ -84,17 +87,27 @@ public final class DPoPConstructor: DPoPConstructorType {
     nonce: Nonce?
   ) async throws -> String {
 
-    let header = try JWSHeader(parameters: [
-      JWTClaimNames.type: Self.type,
-      JWTClaimNames.algorithm: algorithm.name,
-      JWTClaimNames.JWK: jwk.toDictionary()
-    ])
+    var header: JWSHeader
+    if let keyAttestation, !keyAttestation.isEmpty {
+      header = try JWSHeader(parameters: [
+        JWTClaimNames.type: Self.type,
+        JWTClaimNames.algorithm: algorithm.name,
+        JWTClaimNames.JWK: jwk.toDictionary(),
+        JWTClaimNames.keyAttestation: keyAttestation
+      ])
+    } else {
+      header = try JWSHeader(parameters: [
+        JWTClaimNames.type: Self.type,
+        JWTClaimNames.algorithm: algorithm.name,
+        JWTClaimNames.JWK: jwk.toDictionary(),
+      ])
+    }
 
     var dictionary: [String: Any] = [
       JWTClaimNames.issuedAt: Int(Date().timeIntervalSince1970.rounded()),
       JWTClaimNames.htm: Methods.post.rawValue,
       JWTClaimNames.htu: endpoint.absoluteString,
-      JWTClaimNames.jwtId: String.randomBase64URLString(length: 20)
+      JWTClaimNames.jwtId: String.randomBase64URLString(length: 20),
     ]
     
     // Add nonce if available
